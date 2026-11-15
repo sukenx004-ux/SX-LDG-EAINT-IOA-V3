@@ -1,0 +1,79 @@
+name: Deploy PROOF Portal to Fly.io
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "PROOF-PORTAL-V3-FLY-TRIAL.zip"
+      - ".github/workflows/fly-deploy.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proof-portal-fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: proof-portal-v3-change-this
+      FLY_ORG: change-this-org-slug
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      INITIAL_ADMIN_PASSWORD: ${{ secrets.INITIAL_ADMIN_PASSWORD }}
+    steps:
+      - name: Check required settings
+        run: |
+          set -eu
+          test -n "$FLY_API_TOKEN" || { echo "Missing GitHub Actions secret FLY_API_TOKEN"; exit 1; }
+          test "$APP_NAME" != "proof-portal-v3-change-this" || { echo "Edit APP_NAME in this workflow to your unique Fly app name"; exit 1; }
+          test "$FLY_ORG" != "change-this-org-slug" || { echo "Edit FLY_ORG in this workflow to your Fly organization slug"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Create Fly app if it does not exist
+        run: |
+          set -eu
+          if ! flyctl status --app "$APP_NAME" >/dev/null 2>&1; then
+            flyctl apps create "$APP_NAME" --org "$FLY_ORG" --machines
+          fi
+
+      - name: Extract project archive
+        run: |
+          set -eu
+          unzip -q PROOF-PORTAL-V3-FLY-TRIAL.zip -d ./source
+          test -f ./source/PROOF-Portal/fly.toml
+          sed -i "s/__FLY_APP_NAME__/${APP_NAME}/g" ./source/PROOF-Portal/fly.toml
+
+      - name: Prepare persistent storage and first-run secrets
+        working-directory: ./source/PROOF-Portal
+        run: |
+          set -eu
+          if ! flyctl volumes list --app "$APP_NAME" | grep -q 'proof_data'; then
+            flyctl volumes create proof_data --app "$APP_NAME" --region sin --size 1 --yes
+          fi
+          if ! flyctl secrets list --app "$APP_NAME" | grep -q 'PROOF_ENCRYPTION_KEY'; then
+            KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')"
+            flyctl secrets set "PROOF_ENCRYPTION_KEY=$KEY" --app "$APP_NAME"
+          fi
+          if [ -n "${INITIAL_ADMIN_PASSWORD:-}" ]; then
+            if [ "${#INITIAL_ADMIN_PASSWORD}" -lt 12 ]; then
+              echo "INITIAL_ADMIN_PASSWORD must be at least 12 characters"
+              exit 1
+            fi
+            flyctl secrets set INITIAL_ADMIN_USERNAME=admin "INITIAL_ADMIN_PASSWORD=$INITIAL_ADMIN_PASSWORD" --app "$APP_NAME"
+          fi
+
+      - name: Deploy application
+        working-directory: ./source/PROOF-Portal
+        run: flyctl deploy --remote-only --app "$APP_NAME"
+
+      - name: Remove one-time admin bootstrap secret
+        if: ${{ env.INITIAL_ADMIN_PASSWORD != '' }}
+        working-directory: ./source/PROOF-Portal
+        run: flyctl secrets unset INITIAL_ADMIN_USERNAME INITIAL_ADMIN_PASSWORD --app "$APP_NAME"
